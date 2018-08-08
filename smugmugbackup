@@ -1,0 +1,435 @@
+#!/usr/bin/env python
+
+from smuploader import SmugMug
+import argparse, sys, os, hashlib
+from pprint import pprint
+import random
+import hashlib
+from dateutil.parser import parse
+import time
+import exifread
+import datetime
+import re
+import codecs
+
+
+########################################################################
+### Global variables
+########################################################################
+
+smugmug  = 0
+resume   = True
+verbose  = False
+keepgo   = False
+destpath = '.'
+skips    = 0
+changes  = 0
+failures = 0
+limit_id = None
+
+
+#########################################################################
+### Strings
+########################################################################
+
+def make_unicode(input):
+    if type(input) != unicode:
+        encoded =  input.decode('utf-8')
+        return encoded
+    else:
+        return input
+
+
+#########################################################################
+### Time
+########################################################################
+
+def datestring_to_epoch( date ):
+    ts = None
+    if re.search(r"^(19|20)\d{2}:", date):
+        ts = datetime.datetime.strptime(date, '%Y:%m:%d %H:%M:%S')
+    elif re.search(r"^(19|20)\d{2}-", date):
+        ts = parse( date )
+    if ts:
+        sec = int(time.mktime(ts.timetuple()))
+        return sec
+   
+
+#########################################################################
+### Local Disk Operations
+########################################################################
+
+def abs_path(path):
+    return os.path.join( destpath, path )
+
+def check_exists(path):
+    return os.path.exists( abs_path(path) )
+
+def get_size(path):
+    return os.path.getsize( abs_path(path) )
+
+def get_md5sum(path):
+    return hashlib.md5(get_bin_content(path)).hexdigest()
+
+def get_date(path):
+    return int(os.path.getmtime( abs_path(path) ))
+
+def set_date(path, sec):
+    os.utime( abs_path(path), (sec, sec) )
+
+def get_exifdate(path):
+    filepath = abs_path(path)
+    f = open(filepath, 'rb')
+    tags = exifread.process_file(f)
+    for key in ('Image DateTime', 'EXIF DateTimeOriginal'):
+        if key in tags:
+            datestring = "{}".format(tags[key])
+            return datestring
+
+def get_bin_content(path):
+    with open(abs_path(path), 'rb') as f:
+      content = f.read()
+      f.close
+    return content
+
+def set_bin_content(path, content):
+    with open(abs_path(path), 'wb') as f:
+      f.write( content )
+      f.close
+
+def get_txt_content(path):
+    with open(abs_path(path), 'r') as f:
+      content = f.read()
+      f.close
+    return make_unicode(content)
+
+def set_txt_content(path, content):
+    file = codecs.open(abs_path(path), "w", "utf-8")
+    file.write( content )
+    file.close()
+
+# Read all files/dirs in path
+def read_dir(path):
+   return os.listdir( abs_path(path) )
+
+def make_dir(path):
+    if check_exists(path):
+        return
+    os.makedirs(abs_path(path))
+
+
+#########################################################################
+### Local Object Storage
+########################################################################
+
+def ensure_object( check_code, change_code, description_text = None ):
+    """
+    Check if a condition exists. Otherwise create it. Confirm success.
+    """
+
+    global changes
+    global failures
+    global skips
+
+    # Already correct?
+    if check_code():
+        if description_text:
+            if verbose:
+                print u"  {}".format(description_text)
+            skips += 1
+        return
+
+    # Attempt to make change
+    change_code()
+
+    # Was change successful?
+    if check_code():
+        if description_text:
+            print u"+ {}".format(description_text)
+        changes += 1
+    else:
+        if description_text:
+            print u"! {}".format(description_text)
+        failures += 1
+        if not keepgo:
+            raise Exception("An I/O error occured. Exiting.")
+
+def write_bin_file(path, filename, content):
+    """
+    Write content of file
+    """
+
+    file_path = os.path.join(path, filename)
+
+    def check():
+        return check_exists(file_path) and get_bin_content(file_path) == content
+
+    def change():
+        make_dir(path)
+        set_bin_content( file_path, content )
+
+    log = u"File '{}' content saved".format(file_path)
+    ensure_object( check, change, log )
+
+def write_txt_file(path, filename, content):
+    """
+    Write content of file
+    """
+
+    file_path = os.path.join(path, filename)
+
+    def check():
+        return check_exists(file_path) and get_txt_content(file_path) == content
+
+    def change():
+        make_dir(path)
+        set_txt_content( file_path, content )
+
+    log = u"File '{}' content saved".format(file_path)
+    ensure_object( check, change, log )
+
+def stamp_file(path, filename, date):
+    """
+    Set date of file
+    """
+
+    file_path = os.path.join(path, filename)
+    sec = datestring_to_epoch( date )
+
+    def check():
+        return check_exists(file_path) and get_date(file_path) == sec
+
+    def change():
+        set_date( file_path, sec )
+
+    log = u"File '{}' ts('{}') set".format(file_path, date)
+    ensure_object( check, change, log )
+
+
+########################################################################
+### Remote Object Storage
+########################################################################
+
+def download_album_list():
+    """
+    List of all albums in account, in random order
+    """
+
+    albums = []
+    start = 1
+    stepsize = 500
+    while(True):
+        params = {'start': start, 'count': stepsize}
+        response = smugmug.request('GET', smugmug.smugmug_api_base_url + "/user/"+smugmug.username+"!albums", params=params, headers={'Accept': 'application/json'})
+
+        for album in response['Response']['Album'] :
+            if limit_id and album['AlbumKey'] != limit_id:
+               continue
+            albums.append(album)
+
+        if 'NextPage' in response['Response']['Pages']:
+            start += stepsize
+        else:
+            break
+
+    return albums
+
+
+def download_media_list(album_id):
+    """
+    Get list of images in an album.
+    """
+
+    if album_id == None:
+        raise Exception("Album ID must be set to retrieve images")
+
+    images = []
+    start = 1
+    stepsize = 500
+    while(True):
+        params = {'start': start, 'count': stepsize}
+        response = smugmug.request('GET', smugmug.smugmug_api_base_url + "/album/"+album_id+"!images", params=params, headers={'Accept': 'application/json'})
+
+        for image in (response['Response']['AlbumImage'] if 'AlbumImage' in response['Response'] else []):
+            images.append( image )
+
+        if 'NextPage' in response['Response']['Pages']:
+            start += stepsize
+        else:
+            break
+
+    return images
+
+def download_media(url):
+    """
+    Get binary file image or movie file
+    """
+
+    bin_data = smugmug.smugmug_session.request(url=url, method='GET', stream=True).raw
+    bin_data.decode_content = True
+    raw = bin_data.read()
+    if len(raw) == 0:
+       if not keepgo:
+           raise Exception("Downloaded file is 0 bytes")
+
+    return raw
+
+def download_video_info(media):
+    """
+    Get url, size and md5 for largest (original) video
+    """
+
+    site_url = 'https://api.smugmug.com'
+    response = smugmug.request('GET', site_url + media['Uris']['LargestVideo']['Uri'], headers={'Accept': 'application/json'})
+    video_info = response['Response']['LargestVideo']
+    return video_info
+
+
+########################################################################
+### Album
+########################################################################
+
+def album_path(album):
+    return os.path.join(make_unicode(album['AlbumKey']), make_unicode(album['Title']))
+
+def media_path(media):
+    return make_unicode(media['ImageKey'])
+
+def media_date(album, media):
+    # Get date for media:
+    # 1. EXIF date
+    # 2. media Date
+    # 3. media LastUpdated
+    # 4. album Date
+
+    file_path = os.path.join( album_path(album), media_path(media), media['FileName'] )
+
+    for value in get_exifdate(file_path), media['Date'], media['LastUpdated'], album['Date']:
+        if value and re.search(r"^(19|20)\d{2}(\-|\:)", value):
+            return value
+
+def sync_media(album, media):
+    global failures
+    dir_path  = os.path.join( make_unicode(album_path(album)), make_unicode(media_path(media))                    )
+    file_name = make_unicode(media['FileName'])
+    file_path = os.path.join( dir_path, file_name )
+    media_id  = media['ImageKey']
+
+    if media['IsVideo']:
+        video = download_video_info(media)
+        def check():
+            return check_exists(file_path) and get_size(file_path) == video['Size'] and get_md5sum(file_path) == video['MD5']
+        def change():
+            url = video['Url']
+            bin = download_media(url)
+            write_bin_file( dir_path, file_name, bin )
+    else:
+        def check():
+            return check_exists(file_path) and get_size(file_path) == media['ArchivedSize'] and get_md5sum(file_path) == media['ArchivedMD5']
+        def change():
+            url = smugmug.get_image_download_url(media_id)
+            bin = download_media(url)
+            write_bin_file( dir_path, file_name, bin )
+
+    ensure_object( check, change )
+
+    # Set date
+    datetaken = media_date(album, media)
+    if datetaken:
+        stamp_file( dir_path, file_name, datetaken )
+
+    # Set caption
+    desc = media['Caption']
+    if len(desc) > 0:
+        write_txt_file( dir_path, u'caption.txt', desc )
+
+    if datetaken and len(desc) > 0:
+        stamp_file( dir_path, u'caption.txt', datetaken )
+
+def sync_album_description(album):
+    desc = make_unicode(album['Description'])
+    date = album['Date']
+    path = album_path(album)
+
+    # Write description file
+    if len(desc) > 0:
+        write_txt_file( path, u'description.txt', desc)
+        stamp_file( path, u'description.txt', date)
+
+def sync_album(album):
+    """
+    Download an album and it's images from smugmug to the local path
+    """
+
+    sync_album_description(album)
+
+    album_id = album['AlbumKey']
+    medias = download_media_list( album_id )
+    random.shuffle(medias)
+
+    count = 0
+    total = len(medias)
+    for media in medias:
+        count += 1
+        sync_media( album, media )
+
+
+########################################################################
+### Main
+########################################################################
+
+def sync_all():
+    """
+    Download all albums in an account
+    """
+
+    # Download albums in random order
+    albums = download_album_list()
+    random.shuffle(albums)
+
+    num_albums = len(albums)
+    for index, album in enumerate(albums):
+        if verbose:
+            name = make_unicode(album['Title'])
+            id   = make_unicode(album['AlbumKey'])
+            print(u"#### Syncing album name '{}' id {} [{}/{}]".format(name, id, index+1, num_albums))
+        sync_album( album )
+
+    # Clean up
+    if limit_id:
+        return
+
+    seen = []
+    for album in albums:
+      seen.append(make_unicode(album['AlbumKey']))
+    keep = read_dir('')
+    remo = set(keep).difference(set(seen))
+    print "To Delete:"
+    print(remo)
+
+def print_summary():
+    """
+    Print number of changes performed
+    """
+
+    print("Skips: {}. Failures: {}. Changes: {}.".format(skips, failures, changes))
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Download images from SmugMug.')
+    parser.add_argument('path', metavar='PATH',              type=lambda s: unicode(s, 'utf8'),  help='path where the albums are downloaded')
+    parser.add_argument('-k', '--continue', dest='keepgo',   action='store_true', default=False, help='keep going on failures')
+    parser.add_argument('-v', '--verbose',  dest='verbose',  action='store_true', default=False, help='verbose output')
+    parser.add_argument('-s', '--summary',  dest='summary',  action='store_true', default=False, help='count of changes')
+    parser.add_argument('-i', '--id',       dest='album_id', type=lambda s: unicode(s, 'utf8'),  help='limit to album id')
+    args = parser.parse_args()
+
+    smugmug  = SmugMug(args.verbose)
+    smugmug  = SmugMug()
+    verbose  = args.verbose
+    destpath = args.path
+    keepgo   = args.keepgo
+    limit_id = args.album_id
+
+    sync_all()
+    if args.summary:
+        print_summary()
